@@ -1,5 +1,30 @@
 # FlexGate on US staging: step by step
 
+## Summary: what is pending before we can start testing
+
+**The code is done. Nothing is built on staging yet.** Staging already runs the FlexGate code, but it is switched off. To start testing we still need:
+
+1. **Create 2 database roles** on the staging database (needs a DB admin).
+   *Why: FlexGate needs its own database login to record what each request used.*
+2. **Add 3 secrets** in OpenBao: usage database URL, abort token, `redis-gw` password (needs Vault access).
+   *Why: FlexGate can't start or reach its Redis and queue without them.*
+3. **Merge 5 small infra PRs** that turn FlexGate on in staging, one at a time.
+   *Why: they install FlexGate, then switch it on safely, step by step, with a way back.*
+4. **Run 1 Pulumi apply** to create the Pub/Sub topic (infra team).
+   *Why: usage records go through this queue so billing data isn't lost.*
+5. **Run the fence switch** for the chosen org and model (one command).
+   *Why: it makes FlexGate, not LiteLLM, the one in charge of that balance, so it's never charged twice.*
+
+**We need from you:** the org id and the model name.
+
+**Then we test:** send a few chat requests, and check that each one is billed once and correctly.
+
+**Not needed:** no token-service code change for this first test.
+
+Details are below.
+
+---
+
 **Goal:** the bare minimum, one (org, model) served natively by FlexGate on **US staging only**, with correct billing.
 **Scope:** US staging only (cluster `k8s-backoffice-gcp-1`, env `INTERNAL-PROD`, namespace `token-service`). EU staging stays off. Dev is out of scope.
 **Last updated:** 2026-10-06 08:15 UTC. Status is from read-only checks of the live cluster and infra `main`.
@@ -24,35 +49,43 @@
 ## The steps
 
 ### Step 1: Ops prerequisites (before any PR). NOT STARTED
+**Why:** FlexGate needs its own database login to write down what each request used, and passwords to reach its Redis and Pub/Sub. If these don't exist first, FlexGate can't start or can't record usage for billing.
 Needs people with database and OpenBao access; I cannot see or do these.
 - [ ] Create the `flexgate_usage` role and `flexgate_usage_login` on the staging database, then run the grant (infra `docs/onboarding-new-gke-cluster.md`, step 8b). **Verified missing today.**
 - [ ] Seed OpenBao: the usage database URL (`.../token-service/flexgate`, key `USAGE_DATABASE_URL`), the abort token (`.../token-service/flexgate-abort`, key `ABORT_TOKEN`), and the `redis-gw` password. UNVERIFIED.
 - [ ] Decide the capacity and admission numbers (start from dev's block, smaller).
 
 ### Step 2: Infra PR 1, staging `ready`. NOT STARTED
+**Why:** This is what installs FlexGate on staging: its pods, its own Redis (`redis-gw`) that holds balances and limits, and the usage pipeline. In `ready` mode no customer request goes to it yet, so it is safe to install first.
 - [ ] Set `flexgateMode: "ready"` on staging and add the staging FlexGate values block: `activeColor: a` (a=1, b=0), Pub/Sub names, service accounts, `usageIngest.enabled: true`, `redisGw`, `networkPolicy.edgeNamespaces`, `vault.cluster`, cohort (your org), plane models (your model), chat route certified.
 - [ ] Merge. Flux then renders `redis-gw`, `redis-ratelimit`, their secrets, the capacity buffer, the usage-log guard and the alerts (already declared for staging, gated by the mode).
 
 ### Step 3: Pulumi apply for the staging Pub/Sub stack. NOT STARTED
+**Why:** FlexGate sends every request's usage through a Google Pub/Sub queue (like a mailbox) so billing records are not lost. The queue is created by Pulumi, not by the normal deploy, so someone has to run it. Without it, usage cannot be recorded.
 - [ ] `pulumi up` after Step 2 merges. The stack creates nothing until staging is `ready`.
 - [ ] Check: `flexgate-a` Ready, `flexgate_snapshot_age_seconds` under 30, `redis-gw` 3/3, `usage-ingest` running.
 
 ### Step 4: Infra PR 2 and PR 3, the arm-cap store. NOT STARTED
+**Why:** Each model engine can only take a limited number of requests at once. LiteLLM and FlexGate must count that limit in the same place (`redis-gw`), or each would think there is room and overload the engine. We move it in two stages (`dual`, then `redis-gw`) so the count never has a gap.
 - [ ] PR 2: `armSteerStore: "dual"`. Wait for the LiteLLM rollout to finish.
 - [ ] PR 3: `armSteerStore: "redis-gw"`.
 
 ### Step 5: Infra PR 4, mode `on` plus color `b`. NOT STARTED
+**Why:** `on` is the real switch: it lets requests flow to FlexGate and turns on the rule that stops LiteLLM and FlexGate both billing the same balance. A running FlexGate pod never updates its own settings, so a second pod (`b`) is started to get the new ones, such as "chat is allowed".
 - [ ] `flexgateMode: "on"` and `colors.b.replicas: 1`. `on` turns on the LiteLLM fence, and `b` is the only pod that picks up the new template that certifies chat.
 - [ ] Chat weight above 0 is required for certification. Plan: 100 for the test window (the cohort limits FlexGate to your org; everyone else is relayed to LiteLLM). Coordinate with QA first.
 
 ### Step 6: Infra PR 5, switch color. NOT STARTED
+**Why:** This moves traffic from the old pod (`a`) to the new pod (`b`), which has the right settings. The old pod stays running as a quick way back.
 - [ ] After `flexgate-b` is 1/1 Ready: `activeColor: b`.
 
 ### Step 7: Operator steps. NOT STARTED
+**Why:** For each (org, model), exactly one of LiteLLM or FlexGate must be in charge of that balance, so it is never charged twice. All LiteLLM pods must understand that rule first. The fence switch command then hands our one org and model to FlexGate.
 - [ ] Confirm every LiteLLM pod reports the v4 fence hook (runbook, "LiteLLM fence version", Rule 1). File present today; the metric check comes after the fence turns on.
 - [ ] Fence switch for the org and model: dry run, then `--confirm` (`python3 -m scripts.flexgate_fence_switch --org-id <org> --model <model> --to flexgate`, from a portal-api pod).
 
 ### Step 8: Test. NOT STARTED
+**Why:** To prove a request through FlexGate is billed exactly once, for the same amount LiteLLM would have charged, and that nobody is wrongly blocked.
 - [ ] Send chat requests, streaming and non-streaming.
 - [ ] Pass if: a `gateway_usage_events` row appears per request, the balance moves by the same amount LiteLLM would charge, there are no false 402s, and a client disconnect is billed correctly.
 
